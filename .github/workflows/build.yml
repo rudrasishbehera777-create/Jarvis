@@ -1,0 +1,457 @@
+name: Build Jarvis APK
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project
+        run: |
+          mkdir -p $HOME/jarvis && cd $HOME/jarvis
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.jarvis"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.jarvis"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("com.googlecode.libphonenumber:libphonenumber:8.13.40")
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'JARVIS_EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.READ_CONTACTS"/>
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM"/>
+              <queries>
+                  <intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent>
+              <package android:name="com.whatsapp"/>
+                  <package android:name="com.whatsapp.w4b"/>
+              </queries>
+              <application android:theme="@style/Theme.Jarvis" android:label="JARVIS">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.ASSIST"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/java/com/example/jarvis/MainActivity.kt)"
+          cat > app/src/main/java/com/example/jarvis/MainActivity.kt <<'JARVIS_EOF'
+          package com.example.jarvis
+          import android.Manifest
+          import com.google.i18n.phonenumbers.PhoneNumberUtil
+          import android.app.SearchManager
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.os.BatteryManager
+          import android.provider.AlarmClock
+          import android.provider.ContactsContract
+          import android.provider.MediaStore
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.widget.Button
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import java.net.URLEncoder
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
+              private lateinit var status: TextView
+              private lateinit var command: TextView
+              private lateinit var button: Button
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var recognizer: SpeechRecognizer? = null
+              private var listening = false
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  status = findViewById(R.id.status)
+                  command = findViewById(R.id.command)
+                  button = findViewById(R.id.listenButton)
+                  tts = TextToSpeech(this, this)
+                  button.setOnClickListener { onTalkPressed() }
+                  autoListenIfAssist(intent)
+              }
+              override fun onNewIntent(intent: Intent?) {
+                  super.onNewIntent(intent)
+                  autoListenIfAssist(intent)
+              }
+              // Launched as the phone's assistant (power-button hold): start listening right away
+              private fun autoListenIfAssist(i: Intent?) {
+                  if (i?.action == Intent.ACTION_ASSIST || i?.action == Intent.ACTION_MAIN) button.postDelayed({ if (!listening) onTalkPressed() }, 600)
+              }
+              override fun onInit(code: Int) {
+                  if (code == TextToSpeech.SUCCESS) {
+                      tts?.language = Locale.getDefault()
+                      tts?.setPitch(0.9f)
+                      ttsReady = true
+                  }
+              }
+              private fun onTalkPressed() {
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                      != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                      return
+                  }
+                  if (listening) { recognizer?.stopListening(); return }
+                  startListening()
+              }
+              override fun onRequestPermissionsResult(rc: Int, perms: Array<out String>, results: IntArray) {
+                  super.onRequestPermissionsResult(rc, perms, results)
+                  if (rc == 1 && results.firstOrNull() == PackageManager.PERMISSION_GRANTED) startListening()
+                  else if (rc == 1) say("I need microphone access to hear you.")
+                  else if (rc == 2 && results.firstOrNull() == PackageManager.PERMISSION_GRANTED) say("Contacts access granted. Say that again.")
+              }
+              private fun startListening() {
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      say("Speech recognition isn't available on this device.")
+                      return
+                  }
+                  tts?.stop()
+                  recognizer?.destroy()
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                      setRecognitionListener(object : RecognitionListener {
+                          override fun onReadyForSpeech(p: Bundle?) { listening = true; status.text = "Listening..." }
+                          override fun onBeginningOfSpeech() {}
+                          override fun onRmsChanged(v: Float) {}
+                          override fun onBufferReceived(b: ByteArray?) {}
+                          override fun onEndOfSpeech() { status.text = "Thinking..." }
+                          override fun onError(e: Int) {
+                              listening = false
+                              status.text = "Ready"
+                              if (e != SpeechRecognizer.ERROR_CLIENT) say("I didn't catch that.")
+                          }
+                          override fun onResults(r: Bundle?) {
+                              listening = false
+                              val text = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                              if (text.isNullOrBlank()) { status.text = "Ready"; say("I didn't catch that.") }
+                              else handle(text)
+                          }
+                          override fun onPartialResults(p: Bundle?) {}
+                          override fun onEvent(t: Int, p: Bundle?) {}
+                      })
+                  }
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+                  }
+                  recognizer?.startListening(i)
+              }
+              private fun handle(raw: String) {
+                  command.text = "\"$raw\""
+                  val cleaned = raw.lowercase(Locale.getDefault()).replace(".", "").replace(",", "").trim()
+                      .replace(Regex("^(?:hey |ok |okay )?jarvis\\s*"), "").replace(Regex("^please\\s+"), "").trim()
+                  val verbs = "open|play|set|call|dial|text|message|send|turn|navigate|search|launch|start|whatsapp|flashlight|torch|battery|email|take me"
+                  val parts = cleaned.split(Regex("""\s+(?:and then|then|and also|and|also)\s+(?=(?:$verbs)\b)""")).map { it.trim() }
+                  val waContext = parts.any { it.contains("whatsapp") }
+                  val replies = parts.filter { it.isNotEmpty() }.map { p ->
+                      val needsWa = waContext && !p.contains("whatsapp") && Regex("^(?:send|message|text|msg)\\b").containsMatchIn(p)
+                      runCommand(if (needsWa) "$p on whatsapp" else p)
+                  }
+                  say(replies.joinToString(" "))
+              }
+              private fun runCommand(t: String): String {
+                  val reply = when {
+                      Regex("""\bplay\b""").containsMatchIn(t) -> playMusic(t)
+                      t.contains("timer") -> setTimer(t)
+                      t.contains("alarm") -> setAlarm(t)
+                      t.contains("flashlight") || t.contains("torch") ->
+                          torch(!(t.contains("off") || t.contains("disable")))
+                      t.contains("battery") -> {
+                          val p = (getSystemService(BATTERY_SERVICE) as BatteryManager)
+                              .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                          "Battery is at $p percent."
+                      }
+                      Regex("""(?:navigate to|directions to|take me to|route to)\s+(.+)""").find(t) != null -> {
+                          val place = Regex("""(?:navigate to|directions to|take me to|route to)\s+(.+)""").find(t)!!.groupValues[1]
+                          open("google.navigation:q=" + URLEncoder.encode(place, "UTF-8")); "Navigating to $place"
+                      }
+                      Regex("""^(?:call|dial|phone)\s+(.+)""").find(t) != null ->
+                          callOrText(Regex("""^(?:call|dial|phone)\s+(.+)""").find(t)!!.groupValues[1], null, true)
+                      parseSend(t) != null -> sendMessage(parseSend(t)!!)
+                      t.contains("email") || t.contains("e-mail") -> {
+                          val body = t.substringAfter("saying", "")
+                          val i = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:")).putExtra(Intent.EXTRA_TEXT, body.trim())
+                          startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); "Opening email."
+                      }
+                      t.contains("open youtube") -> { open("https://www.youtube.com"); "Opening YouTube" }
+                      t.contains("open google") -> { open("https://www.google.com"); "Opening Google" }
+                      t.startsWith("open ") || t.startsWith("launch ") || t.startsWith("start ") ->
+                          openApp(t.substringAfter(" ").removePrefix("the ").removeSuffix(" app").trim())
+                      t.contains("hello") || t.contains("hi jarvis") || t == "hi" ->
+                          "Hello. Jarvis online and at your service."
+                      t.contains("time") ->
+                          "It's " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())
+                      t.contains("date") || t.contains("today") ->
+                          "Today is " + SimpleDateFormat("EEEE, MMMM d", Locale.getDefault()).format(Date())
+                      t.startsWith("calculate") || t.startsWith("what is") || t.startsWith("what's") -> calculate(t)
+                      t.startsWith("search") || t.startsWith("google") -> {
+                          val q = t.removePrefix("search for").removePrefix("search").removePrefix("google").trim()
+                          if (q.isEmpty()) "What should I search for?"
+                          else { open("https://www.google.com/search?q=" + URLEncoder.encode(q, "UTF-8")); "Searching for $q" }
+                      }
+                      t.contains("thank") -> "Always a pleasure."
+                      else -> "I heard \"$t\", but I don't know that command yet."
+                  }
+                  return reply
+              }
+              private data class Msg(val who: String, val body: String, val wa: Boolean)
+              private fun parseSend(t: String): Msg? {
+                  if (t.contains("email")) return null
+                  val wa = t.contains("whatsapp")
+                  var s = t.replace(Regex("""^open whatsapp( and)?\s*"""), "")
+                      .replace(Regex("""\s+(?:on|in|via|using|through)\s+whatsapp"""), "")
+                  if (s.startsWith("whatsapp ")) s = "message " + s.removePrefix("whatsapp ")
+                  s = s.trim()
+                  Regex("""^(?:send (?:a |an )?(?:message|text|msg)|message|text|msg)\s+(?:to\s+)?(.+?)\s+(?:saying|that says|that)\s+(.+)$""").find(s)
+                      ?.let { return Msg(it.groupValues[1], it.groupValues[2], wa) }
+                  Regex("""^send (?:a |an )?(?:message |text |msg )?(?:saying )?(.+?)\s+to\s+(.+)$""").find(s)
+                      ?.let { return Msg(it.groupValues[2], it.groupValues[1], wa) }
+                  Regex("""^(?:message|text|msg)\s+(\S+)\s+(.+)$""").find(s)
+                      ?.let { return Msg(it.groupValues[1], it.groupValues[2], wa) }
+                  return null
+              }
+              private fun toWhatsAppNumber(raw: String): String? {
+                  return try {
+                      val tm = getSystemService(TELEPHONY_SERVICE) as android.telephony.TelephonyManager
+                      val region = tm.simCountryIso.ifBlank { Locale.getDefault().country }.uppercase()
+                      val util = PhoneNumberUtil.getInstance()
+                      val p = util.parse(raw, region)
+                      if (!util.isPossibleNumber(p)) null
+                      else util.format(p, PhoneNumberUtil.PhoneNumberFormat.E164).removePrefix("+")
+                  } catch (e: Exception) { null }
+              }
+              private fun sendMessage(m: Msg): String {
+                  val num = resolveNumber(m.who.trim())
+                  if (num == "") return "I need contacts access. Allow it, then say that again."
+                  if (num == null) return "I couldn't find ${m.who} in your contacts."
+                  if (!m.wa) {
+                      startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$num"))
+                          .putExtra("sms_body", m.body).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      return "Message to ${m.who} is ready. Press send."
+                  }
+                  val digits = toWhatsAppNumber(num) ?: return "I need the full number with country code for ${m.who}."
+                  val url = "https://wa.me/" + digits + "?text=" + Uri.encode(m.body)
+                  for (pkg in listOf("com.whatsapp", "com.whatsapp.w4b")) {
+                      try {
+                          startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage(pkg).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                          return "Opening WhatsApp chat with ${m.who}. Press send."
+                      } catch (e: Exception) {}
+                  }
+                  open(url)
+                  return "Opening WhatsApp chat with ${m.who}. Press send."
+              }
+              private fun openApp(name: String): String {
+                  val pm = packageManager
+                  val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val hit = apps.firstOrNull { it.loadLabel(pm).toString().lowercase() == name }
+                      ?: apps.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(name) }
+                      ?: return "I couldn't find an app called $name."
+                  val i = pm.getLaunchIntentForPackage(hit.activityInfo.packageName) ?: return "I can't open that app."
+                  startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  return "Opening " + hit.loadLabel(pm)
+              }
+              private fun resolveNumber(who: String): String? {
+                  if (who.any { it.isDigit() }) return who.filter { it.isDigit() || it == '+' }
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+                      ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_CONTACTS), 2)
+                      return ""
+                  }
+                  contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+                      ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?", arrayOf("%$who%"), null
+                  )?.use { if (it.moveToFirst()) return it.getString(0) }
+                  return null
+              }
+              private fun callOrText(who: String, body: String?, call: Boolean): String {
+                  val num = resolveNumber(who.trim())
+                  if (num == "") return "I need contacts access. Allow it, then say that again."
+                  if (num == null) return "I couldn't find $who in your contacts."
+                  val i = if (call) Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num"))
+                  else Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$num")).putExtra("sms_body", body ?: "")
+                  startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  return if (call) "Calling $who. Press the call button." else "Message to $who is ready. Press send."
+              }
+              private fun setTimer(t: String): String {
+                  var secs = 0
+                  Regex("""(\d+)\s*(hour|minute|min|second|sec)""").findAll(t).forEach {
+                      val n = it.groupValues[1].toInt()
+                      secs += when (it.groupValues[2]) { "hour" -> n * 3600; "minute", "min" -> n * 60; else -> n }
+                  }
+                  if (secs == 0) return "How long should the timer be?"
+                  val i = Intent(AlarmClock.ACTION_SET_TIMER).putExtra(AlarmClock.EXTRA_LENGTH, secs)
+                      .putExtra(AlarmClock.EXTRA_SKIP_UI, true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  return try { startActivity(i); "Timer set for ${secs / 60} minutes ${secs % 60} seconds." }
+                  catch (e: Exception) { "I couldn't set the timer." }
+              }
+              private fun setAlarm(t: String): String {
+                  val m = Regex("""(\d{1,2})(?::|\s)?(\d{2})?\s*(am|pm)?""").find(t.substringAfter("alarm"))
+                      ?: return "What time should the alarm be?"
+                  var h = m.groupValues[1].toInt()
+                  val min = m.groupValues[2].ifEmpty { "0" }.toInt()
+                  when (m.groupValues[3]) { "pm" -> if (h < 12) h += 12; "am" -> if (h == 12) h = 0 }
+                  if (h > 23 || min > 59) return "That isn't a valid time."
+                  val i = Intent(AlarmClock.ACTION_SET_ALARM).putExtra(AlarmClock.EXTRA_HOUR, h)
+                      .putExtra(AlarmClock.EXTRA_MINUTES, min).putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  return try { startActivity(i); "Alarm set for %d:%02d.".format(h, min) }
+                  catch (e: Exception) { "I couldn't set the alarm." }
+              }
+              private fun torch(on: Boolean): String {
+                  return try {
+                      val cm = getSystemService(CAMERA_SERVICE) as CameraManager
+                      val id = cm.cameraIdList.firstOrNull {
+                          cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                      } ?: return "I couldn't find a flashlight."
+                      cm.setTorchMode(id, on)
+                      if (on) "Flashlight on." else "Flashlight off."
+                  } catch (e: Exception) { "I couldn't control the flashlight." }
+              }
+              private val anySong = listOf("top hits 2026", "popular songs", "chill music", "pop hits", "lofi beats", "best rock songs")
+              private fun playMusic(t: String): String {
+                  var q = t.substringAfter("play").trim()
+                  val generic = q.isEmpty() || Regex("^(any|a|some|me|something|random)\\b.*(song|music|track)?$").matches(q)
+                          || q.contains("any song") || q.contains("some music") || q.contains("a song")
+                  if (generic) q = anySong.random()
+                  val i = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH).apply {
+                      putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
+                      putExtra(SearchManager.QUERY, q)
+                      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  }
+                  for (pkg in listOf("com.google.android.apps.youtube.music", "com.google.android.youtube")) {
+                      try { startActivity(Intent(i).setPackage(pkg)); return "Playing $q" } catch (e: Exception) {}
+                  }
+                  open("https://www.youtube.com/results?search_query=" + URLEncoder.encode(q, "UTF-8"))
+                  return "Playing $q"
+              }
+              private fun calculate(t: String): String {
+                  val m = Regex("(-?\\d+(?:\\.\\d+)?)\\s*(times|multiplied by|x|\\*|plus|\\+|minus|-|divided by|over|/)\\s*(-?\\d+(?:\\.\\d+)?)")
+                      .find(t) ?: return "I couldn't work out that sum."
+                  val a = m.groupValues[1].toDouble()
+                  val b = m.groupValues[3].toDouble()
+                  val r = when (m.groupValues[2]) {
+                      "times", "multiplied by", "x", "*" -> a * b
+                      "plus", "+" -> a + b
+                      "minus", "-" -> a - b
+                      else -> { if (b == 0.0) return "I can't divide by zero."; a / b }
+                  }
+                  val s = if (r == Math.floor(r) && Math.abs(r) < 1e15) r.toLong().toString() else "%.4f".format(r).trimEnd('0').trimEnd('.')
+                  return "The answer is $s"
+              }
+              private fun open(url: String) {
+                  try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                  catch (e: Exception) { Toast.makeText(this, "Couldn't open that.", Toast.LENGTH_SHORT).show() }
+              }
+              private fun say(text: String) {
+                  status.text = text
+                  if (ttsReady) tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "jarvis")
+              }
+              override fun onDestroy() {
+                  recognizer?.destroy()
+                  tts?.shutdown()
+                  super.onDestroy()
+              }
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/res/layout/activity_main.xml)"
+          cat > app/src/main/res/layout/activity_main.xml <<'JARVIS_EOF'
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:gravity="center" android:padding="28dp"
+              android:background="#05070A">
+              <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:text="J A R V I S" android:textSize="32sp" android:textStyle="bold"
+                  android:textColor="#FFFFFF" android:layout_marginBottom="28dp"/>
+              <TextView android:id="@+id/status" android:layout_width="match_parent"
+                  android:layout_height="wrap_content" android:text="Ready" android:textSize="18sp"
+                  android:textColor="#FFFFFF" android:gravity="center" android:padding="16dp"/>
+              <TextView android:id="@+id/command" android:layout_width="match_parent"
+                  android:layout_height="wrap_content" android:text="Tap the button and speak"
+                  android:textSize="16sp" android:textColor="#BBBBBB" android:gravity="center"
+                  android:padding="16dp" android:layout_marginBottom="24dp"/>
+              <Button android:id="@+id/listenButton" android:layout_width="220dp"
+                  android:layout_height="64dp" android:text="TALK TO JARVIS" android:textSize="16sp"/>
+          </LinearLayout>
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/res/values/styles.xml)"
+          cat > app/src/main/res/values/styles.xml <<'JARVIS_EOF'
+          <resources>
+          <style name="Theme.Jarvis" parent="Theme.Material3.DayNight.NoActionBar">
+              <item name="android:fontFamily">sans</item>
+              <item name="android:statusBarColor">#05070A</item>
+              <item name="android:navigationBarColor">#05070A</item>
+          </style>
+          </resources>
+          JARVIS_EOF
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'JARVIS_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          JARVIS_EOF
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'JARVIS_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Jarvis"
+          include(":app")
+          JARVIS_EOF
+      - name: Build
+        run: cd $HOME/jarvis && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-apk
+          path: ~/jarvis/app/build/outputs/apk/debug/app-debug.apk
